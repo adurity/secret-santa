@@ -1,0 +1,27 @@
+# Copy to pairs.toml (git-ignored) and edit.
+#
+# `pairs` must come BEFORE the [participants.*] tables (TOML rule).
+# Each participant id appears in exactly one pair; ids are arbitrary short
+# keys, so names may contain spaces/accents and two people may share a
+# first name as long as their full `name`s differ.
+
+pairs = [
+  ["alice",  "bob"],
+  ["mickey", "minnie"],
+]
+
+[participants.alice]
+name  = "Alice Smith"
+email = "alice@example.com"
+
+[participants.bob]
+name  = "Bob Jones"
+email = "bob@example.com"
+
+[participants.mickey]
+name  = "Mickey"
+email = "mickey@example.com"
+
+[participants.minnie]
+name  = "Minnie"
+email = "minnie@example.com"

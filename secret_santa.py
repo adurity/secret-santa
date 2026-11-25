@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Paired Secret Santa: everyone gives two gifts and receives two gifts.
 
-Input: one pair per line: name, email, name, email (whitespace-separated;
-blank lines and lines starting with '#' are ignored).
+Input is a TOML file (Python 3.11+): who the participants are, and who is
+paired with whom.  Participants are keyed by a stable id; pairs refer to ids.
 
-    Alice alice@example.com Bob bob@example.com
-    Mickey mickey@example.com Minnie minnie@example.com
+    pairs = [
+      ["alice", "bob"],
+      ["mickey", "minnie"],
+    ]
+
+    [participants.alice]
+    name = "Alice"
+    email = "alice@example.com"
+    ...
 
 Output: one line per person, partner first, then the random extra recipient.
 
     Alice: Bob Mickey
     Bob: Alice Minnie
 
-With ``--send`` the assignments are NOT printed; each person is emailed their
-own two recipients through Gmail SMTP instead (see ``send_messages``).
+With ``--send PROVIDER`` the assignments are NOT printed; each person is
+emailed their own two recipients instead (providers: see ``mailers.py``).
 
 Each person gives to their partner (so each person receives one gift from
 their partner) plus one other person.  The "extra" gifts form a random
@@ -24,48 +31,92 @@ Randomness comes from ``secrets.SystemRandom`` (the OS CSPRNG).
 """
 
 import argparse
-import os
 import re
 import secrets
-import smtplib
 import sys
+import tomllib
+from dataclasses import dataclass
+from email.headerregistry import Address
 from email.message import EmailMessage
 
+import mailers
+
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-GMAIL_HOST, GMAIL_PORT = "smtp.gmail.com", 465
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+TOP_KEYS = {"participants", "pairs"}
+PARTICIPANT_KEYS = {"name", "email"}
 
 
-def parse_pairs(text):
-    """Parse text into ``(pairs, emails)``.
+@dataclass(frozen=True)
+class Participant:
+    id: str
+    name: str
+    email: str
 
-    ``pairs`` is a list of (name, name) tuples; ``emails`` maps name -> email.
+
+def load_config(text):
+    """Parse and validate TOML text into ``(participants, pairs)``.
+
+    ``participants`` maps id -> Participant; ``pairs`` is a list of
+    (id, id) tuples.  Raises ValueError with a readable message.
     """
-    pairs = []
-    emails = {}
-    for lineno, line in enumerate(text.splitlines(), 1):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        tokens = line.split()
-        if len(tokens) != 4:
-            raise ValueError(
-                f"line {lineno}: expected 'name email name email', "
-                f"got {len(tokens)} fields"
-            )
-        pair = []
-        for name, email in (tokens[0:2], tokens[2:4]):
-            if name in emails:
-                raise ValueError(f"line {lineno}: duplicate name {name!r}")
-            if not EMAIL_RE.match(email):
-                raise ValueError(f"line {lineno}: invalid email {email!r}")
-            emails[name] = email
-            pair.append(name)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"invalid TOML: {e}") from e
+
+    unknown = set(data) - TOP_KEYS
+    if unknown:
+        raise ValueError(f"unknown top-level keys: {sorted(unknown)}")
+
+    raw = data.get("participants")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("missing [participants.<id>] tables")
+
+    participants = {}
+    names = set()
+    for pid, fields in raw.items():
+        if not isinstance(fields, dict):
+            raise ValueError(f"participant {pid!r} must be a table")
+        unknown = set(fields) - PARTICIPANT_KEYS
+        if unknown:
+            raise ValueError(f"participant {pid!r}: unknown keys {sorted(unknown)}")
+        name, email = fields.get("name"), fields.get("email")
+        if not isinstance(name, str) or not name.strip() or CONTROL_RE.search(name):
+            raise ValueError(f"participant {pid!r}: invalid or missing name")
+        if not isinstance(email, str) or not EMAIL_RE.match(email) or CONTROL_RE.search(email):
+            raise ValueError(f"participant {pid!r}: invalid or missing email")
+        if name in names:
+            raise ValueError(f"participant {pid!r}: duplicate name {name!r}")
+        names.add(name)
+        participants[pid] = Participant(pid, name, email)
+
+    raw_pairs = data.get("pairs")
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise ValueError("missing 'pairs' list")
+    pairs, seen = [], set()
+    for i, pair in enumerate(raw_pairs, 1):
+        if not (isinstance(pair, list) and len(pair) == 2
+                and all(isinstance(p, str) for p in pair)):
+            raise ValueError(f"pair #{i}: expected [id, id]")
+        for pid in pair:
+            if pid not in participants:
+                raise ValueError(f"pair #{i}: unknown participant id {pid!r}")
+            if pid in seen:
+                raise ValueError(f"pair #{i}: {pid!r} appears in more than one pair")
+            seen.add(pid)
+        if pair[0] == pair[1]:
+            raise ValueError(f"pair #{i}: {pair[0]!r} is paired with themselves")
         pairs.append(tuple(pair))
-    return pairs, emails
+
+    unpaired = [p for p in participants if p not in seen]
+    if unpaired:
+        raise ValueError(f"participants not in any pair: {unpaired}")
+    return participants, pairs
 
 
 def assign(pairs, rng=None):
-    """Return {giver: (partner, extra_recipient)} for every person.
+    """Return {giver: (partner, extra_recipient)} for every id in ``pairs``.
 
     ``rng`` must provide ``shuffle``; defaults to the OS CSPRNG.  Passing a
     custom one is intended for tests only.
@@ -78,7 +129,7 @@ def assign(pairs, rng=None):
     partner = {}
     for a, b in pairs:
         if a == b or a in partner or b in partner:
-            raise ValueError(f"invalid or duplicate name in pair {a!r}, {b!r}")
+            raise ValueError(f"invalid or duplicate id in pair {a!r}, {b!r}")
         partner[a] = b
         partner[b] = a
 
@@ -93,70 +144,78 @@ def assign(pairs, rng=None):
     return {p: (partner[p], t) for p, t in zip(people, targets)}
 
 
-def format_assignments(assignments):
-    return "\n".join(f"{g}: {a} {b}" for g, (a, b) in assignments.items())
+def format_assignments(assignments, participants):
+    name = lambda pid: participants[pid].name
+    return "\n".join(
+        f"{name(g)}: {name(a)} {name(b)}" for g, (a, b) in assignments.items()
+    )
 
 
-def build_messages(assignments, emails, sender):
+def build_messages(assignments, participants, sender=None):
     """One EmailMessage per giver, containing only that giver's recipients."""
     messages = []
     for giver, (partner, extra) in assignments.items():
+        g = participants[giver]
         msg = EmailMessage()
-        msg["From"] = sender
-        msg["To"] = emails[giver]
+        if sender:
+            msg["From"] = sender
+        msg["To"] = Address(display_name=g.name, addr_spec=g.email)
         msg["Subject"] = "Your Secret Santa assignments"
         msg.set_content(
-            f"Hi {giver},\n\n"
+            f"Hi {g.name},\n\n"
             "You are giving two gifts this year:\n"
-            f"  1. {partner}\n"
-            f"  2. {extra}\n\n"
+            f"  1. {participants[partner].name}\n"
+            f"  2. {participants[extra].name}\n\n"
             "Keep it secret!\n"
         )
         messages.append(msg)
     return messages
 
 
-def send_messages(messages, user, app_password, smtp_factory=None):
-    """Send via Gmail SMTP using an app password (not your account password)."""
-    smtp_factory = smtp_factory or smtplib.SMTP_SSL
-    with smtp_factory(GMAIL_HOST, GMAIL_PORT) as server:
-        server.login(user, app_password)
-        for msg in messages:
-            server.send_message(msg)
-
-
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Paired Secret Santa.")
-    ap.add_argument("pairs_file", nargs="?", help="pairs file (default: stdin)")
+    ap.add_argument("config", nargs="?", help="TOML file (default: stdin)")
     ap.add_argument(
         "--send",
-        action="store_true",
-        help="email each giver via Gmail instead of printing assignments; "
-        "needs GMAIL_ADDRESS and GMAIL_APP_PASSWORD in the environment",
+        metavar="PROVIDER",
+        choices=sorted(mailers.PROVIDERS),
+        help="email each giver via PROVIDER instead of printing assignments "
+        f"({', '.join(sorted(mailers.PROVIDERS))}); credentials come from "
+        "environment variables (see README)",
+    )
+    ap.add_argument("--from", dest="sender", help="From address (or MAIL_FROM)")
+    ap.add_argument("--smtp-host", help="SMTP server (or SMTP_HOST)")
+    ap.add_argument("--smtp-port", help="SMTP port (or SMTP_PORT)")
+    ap.add_argument(
+        "--smtp-security",
+        choices=["ssl", "starttls"],
+        help="SMTP transport security (or SMTP_SECURITY; default ssl)",
     )
     args = ap.parse_args(argv)
     try:
+        mailer = None
         if args.send:
-            user = os.environ.get("GMAIL_ADDRESS")
-            password = os.environ.get("GMAIL_APP_PASSWORD")
-            if not user or not password:
-                raise ValueError(
-                    "--send requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD"
-                )
-        if args.pairs_file:
-            with open(args.pairs_file) as f:
+            mailer = mailers.create_mailer(
+                args.send,
+                sender=args.sender,
+                smtp_host=args.smtp_host,
+                smtp_port=args.smtp_port,
+                smtp_security=args.smtp_security,
+            )
+        if args.config:
+            with open(args.config, encoding="utf-8") as f:
                 text = f.read()
         else:
             text = sys.stdin.read()
-        pairs, emails = parse_pairs(text)
+        participants, pairs = load_config(text)
         assignments = assign(pairs)
-        if args.send:
-            messages = build_messages(assignments, emails, user)
-            send_messages(messages, user, password)
-            print(f"Sent {len(messages)} emails.")
+        if mailer:
+            messages = build_messages(assignments, participants, mailer.sender)
+            count = mailers.send_all(mailer, messages)
+            print(f"Sent {count} emails.")
         else:
-            print(format_assignments(assignments))
-    except (OSError, ValueError, smtplib.SMTPException) as e:
+            print(format_assignments(assignments, participants))
+    except (OSError, ValueError, mailers.MailError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     return 0

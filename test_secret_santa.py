@@ -27,29 +27,52 @@ def check_valid(tc, pairs, result):
     tc.assertTrue(all(c == 2 for c in received.values()), received)
 
 
-class ParseTests(unittest.TestCase):
-    def test_parse(self):
-        pairs, emails = ss.parse_pairs(
-            "Alice a@x.com Bob b@x.com\n\n# c\n  Mickey m@x.com   Minnie n@x.com \n"
-        )
-        self.assertEqual(pairs, [("Alice", "Bob"), ("Mickey", "Minnie")])
-        self.assertEqual(
-            emails,
-            {"Alice": "a@x.com", "Bob": "b@x.com", "Mickey": "m@x.com", "Minnie": "n@x.com"},
-        )
+def toml(pairs, extra=""):
+    ids = [p for pair in pairs for p in pair]
+    out = "pairs = " + repr([list(p) for p in pairs]).replace("'", '"') + "\n"
+    for i in ids:
+        out += f'[participants.{i}]\nname = "{i.title()}"\nemail = "{i}@x.com"\n'
+    return out + extra
 
-    def test_bad_input(self):
-        for text in [
-            "Alice Bob",                            # old format, no emails
-            "A a@x.com B",                          # missing email
-            "A a@x.com B b@x.com C",                # too many fields
-            "A a@x.com B b@x.com\nB b@x.com C c@x.com",  # duplicate name
-            "A a@x.com A b@x.com",                  # self-pair
-            "A nope B b@x.com",                     # invalid email
-            "A a@x B b@x.com",                      # email without domain dot
-        ]:
-            with self.subTest(text=text), self.assertRaises(ValueError):
-                ss.parse_pairs(text)
+
+GOOD = toml([("alice", "bob"), ("mickey", "minnie")])
+
+
+class ConfigTests(unittest.TestCase):
+    def test_load(self):
+        participants, pairs = ss.load_config(GOOD)
+        self.assertEqual(pairs, [("alice", "bob"), ("mickey", "minnie")])
+        self.assertEqual(
+            participants["alice"], ss.Participant("alice", "Alice", "alice@x.com")
+        )
+        self.assertEqual(len(participants), 4)
+
+    def test_names_may_have_spaces_and_unicode(self):
+        text = toml([("a", "b"), ("c", "d")]).replace('"A"', '"Ana María O\'Neil"')
+        participants, _ = ss.load_config(text)
+        self.assertEqual(participants["a"].name, "Ana María O'Neil")
+
+    def test_bad_config(self):
+        base = toml([("a", "b"), ("c", "d")])
+        cases = {
+            "not toml": "this is = = not toml",
+            "unknown top key": base + "extra = 1\n",
+            "unknown participant key": base + '[participants.a.x]\n',
+            "typo field": base.replace("email =", "emial =", 1),
+            "bad email": base.replace("a@x.com", "nope"),
+            "missing name": base.replace('name = "A"\n', "", 1),
+            "control char in name": base.replace('"A"', '"A\\nBcc: evil@x.com"'),
+            "unknown id in pair": base.replace('["a", "b"]', '["a", "zzz"]'),
+            "id in two pairs": base.replace('["c", "d"]', '["a", "d"]'),
+            "self pair": base.replace('["a", "b"]', '["a", "a"]'),
+            "unpaired participant": base + '[participants.e]\nname = "E"\nemail = "e@x.com"\n',
+            "duplicate display name": base.replace('"C"', '"A"'),
+            "no pairs": base.replace("pairs = [[\"a\", \"b\"], [\"c\", \"d\"]]", "pairs = []"),
+            "no participants": 'pairs = [["a","b"]]',
+        }
+        for label, text in cases.items():
+            with self.subTest(label), self.assertRaises(ValueError):
+                ss.load_config(text)
 
 
 class AssignTests(unittest.TestCase):
@@ -109,64 +132,86 @@ class AssignTests(unittest.TestCase):
         self.assertGreater(min(c.values()), 800)
 
 
-INPUT = "Alice a@x.com Bob b@x.com\nMickey m@x.com Minnie n@x.com\n"
-
-
 class CliTests(unittest.TestCase):
+    def run_main(self, argv, stdin=GOOD, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict("os.environ", env or {}, clear=True), \
+                mock.patch("sys.stdin", io.StringIO(stdin)), \
+                redirect_stdout(out), mock.patch("sys.stderr", err):
+            code = ss.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
     def test_output_format(self):
-        buf = io.StringIO()
-        with mock.patch("sys.stdin", io.StringIO(INPUT)), redirect_stdout(buf):
-            self.assertEqual(ss.main([]), 0)
-        lines = buf.getvalue().splitlines()
+        code, out, _ = self.run_main([])
+        self.assertEqual(code, 0)
+        lines = out.splitlines()
         self.assertEqual(len(lines), 4)
         self.assertTrue(lines[0].startswith("Alice: Bob "))
         self.assertTrue(lines[1].startswith("Bob: Alice "))
 
+    def test_reads_file(self):
+        import os, tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+            f.write(GOOD)
+        self.addCleanup(os.unlink, f.name)
+        code, out, _ = self.run_main([f.name], stdin="")
+        self.assertEqual((code, len(out.splitlines())), (0, 4))
+
     def test_error_exit_code(self):
-        with mock.patch("sys.stdin", io.StringIO("Alice Bob\n")), \
-                mock.patch("sys.stderr", io.StringIO()):
-            self.assertEqual(ss.main([]), 1)
+        code, _, err = self.run_main([], stdin="garbage = = =")
+        self.assertEqual(code, 1)
+        self.assertIn("invalid TOML", err)
 
     def test_send_requires_credentials(self):
-        with mock.patch.dict("os.environ", {}, clear=True), \
-                mock.patch("sys.stdin", io.StringIO(INPUT)), \
-                mock.patch("sys.stderr", io.StringIO()) as err:
-            self.assertEqual(ss.main(["--send"]), 1)
-        self.assertIn("GMAIL_ADDRESS", err.getvalue())
+        for provider, needle in [("smtp", "SMTP"), ("gmail-api", "GMAIL_")]:
+            code, out, err = self.run_main(["--send", provider])
+            self.assertEqual(code, 1)
+            self.assertIn(needle, err)
+            self.assertEqual(out, "")
 
-    def test_send_emails_and_does_not_print_assignments(self):
-        env = {"GMAIL_ADDRESS": "santa@gmail.com", "GMAIL_APP_PASSWORD": "pw"}
+    def test_send_smtp_end_to_end_without_printing_assignments(self):
+        env = {"SMTP_HOST": "mail.example.org", "SMTP_USER": "santa@example.org",
+               "SMTP_PASSWORD": "pw"}
         server = mock.MagicMock()
-        server.__enter__.return_value = server
-        factory = mock.MagicMock(return_value=server)
-        buf = io.StringIO()
-        with mock.patch.dict("os.environ", env, clear=True), \
-                mock.patch("smtplib.SMTP_SSL", factory), \
-                mock.patch("sys.stdin", io.StringIO(INPUT)), redirect_stdout(buf):
-            self.assertEqual(ss.main(["--send"]), 0)
-        factory.assert_called_once_with("smtp.gmail.com", 465)
-        server.login.assert_called_once_with("santa@gmail.com", "pw")
+        with mock.patch("smtplib.SMTP_SSL", return_value=server) as factory:
+            code, out, _ = self.run_main(["--send", "smtp"], env=env)
+        self.assertEqual(code, 0)
+        self.assertEqual(factory.call_args[0], ("mail.example.org", 465))
+        server.login.assert_called_once_with("santa@example.org", "pw")
         self.assertEqual(server.send_message.call_count, 4)
-        self.assertEqual(buf.getvalue().strip(), "Sent 4 emails.")
+        self.assertEqual(out.strip(), "Sent 4 emails.")
+
+    def test_send_gmail_api_end_to_end(self):
+        env = {"GMAIL_CLIENT_ID": "i", "GMAIL_CLIENT_SECRET": "s",
+               "GMAIL_REFRESH_TOKEN": "r"}
+        with mock.patch("mailers._post", return_value={"access_token": "tok"}) as post:
+            code, out, _ = self.run_main(["--send", "gmail-api"], env=env)
+        self.assertEqual(code, 0)
+        self.assertEqual(post.call_count, 1 + 4)  # token + 4 sends
+        self.assertEqual(out.strip(), "Sent 4 emails.")
 
 
 class EmailTests(unittest.TestCase):
     def test_build_messages(self):
-        pairs, emails = ss.parse_pairs(INPUT)
+        participants, pairs = ss.load_config(GOOD)
         result = ss.assign(pairs)
-        msgs = ss.build_messages(result, emails, "santa@gmail.com")
+        msgs = ss.build_messages(result, participants, "santa@x.com")
         self.assertEqual(len(msgs), 4)
         for msg, (giver, gifts) in zip(msgs, result.items()):
-            self.assertEqual(msg["To"], emails[giver])
-            self.assertEqual(msg["From"], "santa@gmail.com")
+            self.assertEqual(msg["To"].addresses[0].addr_spec, participants[giver].email)
+            self.assertEqual(msg["From"], "santa@x.com")
             body = msg.get_content()
-            for recipient in gifts:
-                self.assertIn(recipient, body)
+            for rid in gifts:
+                self.assertIn(participants[rid].name, body)
             # nobody else's recipients leak into this message
-            others = {p for p in result if p != giver and p not in gifts}
-            for other in others:
-                self.assertNotIn(f"  1. {other}", body)
-                self.assertNotIn(f"  2. {other}", body)
+            for other in set(result) - {giver, *gifts}:
+                self.assertNotIn(f"  1. {participants[other].name}", body)
+                self.assertNotIn(f"  2. {participants[other].name}", body)
+
+    def test_from_omitted_when_no_sender(self):
+        participants, pairs = ss.load_config(GOOD)
+        msg = ss.build_messages(ss.assign(pairs), participants)[0]
+        self.assertIsNone(msg["From"])
 
 
 if __name__ == "__main__":
