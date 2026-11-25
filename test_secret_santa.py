@@ -29,13 +29,25 @@ def check_valid(tc, pairs, result):
 
 class ParseTests(unittest.TestCase):
     def test_parse(self):
+        pairs, emails = ss.parse_pairs(
+            "Alice a@x.com Bob b@x.com\n\n# c\n  Mickey m@x.com   Minnie n@x.com \n"
+        )
+        self.assertEqual(pairs, [("Alice", "Bob"), ("Mickey", "Minnie")])
         self.assertEqual(
-            ss.parse_pairs("Alice Bob\n\n# c\n  Mickey   Minnie \n"),
-            [("Alice", "Bob"), ("Mickey", "Minnie")],
+            emails,
+            {"Alice": "a@x.com", "Bob": "b@x.com", "Mickey": "m@x.com", "Minnie": "n@x.com"},
         )
 
     def test_bad_input(self):
-        for text in ["Alice", "A B C", "A B\nB C", "A A", "A B\nC A"]:
+        for text in [
+            "Alice Bob",                            # old format, no emails
+            "A a@x.com B",                          # missing email
+            "A a@x.com B b@x.com C",                # too many fields
+            "A a@x.com B b@x.com\nB b@x.com C c@x.com",  # duplicate name
+            "A a@x.com A b@x.com",                  # self-pair
+            "A nope B b@x.com",                     # invalid email
+            "A a@x B b@x.com",                      # email without domain dot
+        ]:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 ss.parse_pairs(text)
 
@@ -97,11 +109,13 @@ class AssignTests(unittest.TestCase):
         self.assertGreater(min(c.values()), 800)
 
 
+INPUT = "Alice a@x.com Bob b@x.com\nMickey m@x.com Minnie n@x.com\n"
+
+
 class CliTests(unittest.TestCase):
     def test_output_format(self):
         buf = io.StringIO()
-        with mock.patch("sys.stdin", io.StringIO("Alice Bob\nMickey Minnie\n")), \
-                redirect_stdout(buf):
+        with mock.patch("sys.stdin", io.StringIO(INPUT)), redirect_stdout(buf):
             self.assertEqual(ss.main([]), 0)
         lines = buf.getvalue().splitlines()
         self.assertEqual(len(lines), 4)
@@ -112,6 +126,47 @@ class CliTests(unittest.TestCase):
         with mock.patch("sys.stdin", io.StringIO("Alice Bob\n")), \
                 mock.patch("sys.stderr", io.StringIO()):
             self.assertEqual(ss.main([]), 1)
+
+    def test_send_requires_credentials(self):
+        with mock.patch.dict("os.environ", {}, clear=True), \
+                mock.patch("sys.stdin", io.StringIO(INPUT)), \
+                mock.patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(ss.main(["--send"]), 1)
+        self.assertIn("GMAIL_ADDRESS", err.getvalue())
+
+    def test_send_emails_and_does_not_print_assignments(self):
+        env = {"GMAIL_ADDRESS": "santa@gmail.com", "GMAIL_APP_PASSWORD": "pw"}
+        server = mock.MagicMock()
+        server.__enter__.return_value = server
+        factory = mock.MagicMock(return_value=server)
+        buf = io.StringIO()
+        with mock.patch.dict("os.environ", env, clear=True), \
+                mock.patch("smtplib.SMTP_SSL", factory), \
+                mock.patch("sys.stdin", io.StringIO(INPUT)), redirect_stdout(buf):
+            self.assertEqual(ss.main(["--send"]), 0)
+        factory.assert_called_once_with("smtp.gmail.com", 465)
+        server.login.assert_called_once_with("santa@gmail.com", "pw")
+        self.assertEqual(server.send_message.call_count, 4)
+        self.assertEqual(buf.getvalue().strip(), "Sent 4 emails.")
+
+
+class EmailTests(unittest.TestCase):
+    def test_build_messages(self):
+        pairs, emails = ss.parse_pairs(INPUT)
+        result = ss.assign(pairs)
+        msgs = ss.build_messages(result, emails, "santa@gmail.com")
+        self.assertEqual(len(msgs), 4)
+        for msg, (giver, gifts) in zip(msgs, result.items()):
+            self.assertEqual(msg["To"], emails[giver])
+            self.assertEqual(msg["From"], "santa@gmail.com")
+            body = msg.get_content()
+            for recipient in gifts:
+                self.assertIn(recipient, body)
+            # nobody else's recipients leak into this message
+            others = {p for p in result if p != giver and p not in gifts}
+            for other in others:
+                self.assertNotIn(f"  1. {other}", body)
+                self.assertNotIn(f"  2. {other}", body)
 
 
 if __name__ == "__main__":

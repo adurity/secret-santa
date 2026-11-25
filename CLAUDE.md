@@ -17,6 +17,8 @@ random other person) and receives exactly two.
 - Keep it uniform: invalid shuffles are rejected and redone, not patched up.
 - Output format is `Name: Partner Extra`, partner first, in input order.
 - Needs at least two pairs; names are whitespace-free and unique.
+- Input line format is `name email name email`. `parse_pairs` returns `(pairs, emails)`; `assign` only sees names.
+- `--send` emails each giver (Gmail SMTP, credentials from `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` env vars, never CLI args or files) and must not print assignments. Each email contains only that giver's recipients. Tests must mock SMTP; never send real mail from tests.
 
 ## Style
 - Python 3, stdlib only, no new dependencies without a good reason.
